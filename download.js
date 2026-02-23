@@ -1,13 +1,41 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from "node:child_process";
+import { uploadToMux } from './mux_upload.js';
 
 const INPUT_FILE = 'direct_videos.json';
 const DOWNLOAD_DIR = 'downloads';
+const UPLOADED_FILE = 'uploaded_videos.json';
 const CONCURRENCY_LIMIT = 3; // Number of parallel downloads. 3 is a safe number to not get blocked.
+
+let isShuttingDown = false;
+const activeProcesses = new Set();
+
+process.on('SIGINT', () => {
+  console.log('\n[INFO] Gracefully shutting down... Stopping downloads and uploads. (Press Ctrl+C again to force quit)');
+  isShuttingDown = true;
+  for (const p of activeProcesses) {
+    try { p.kill('SIGINT'); } catch(e) {}
+  }
+});
 
 function sanitize(name) {
   return name.replace(/[<>:"\/\\|?*]+/g, '_').trim();
+}
+
+function loadProgress() {
+  if (fs.existsSync(UPLOADED_FILE)) {
+    try {
+      return JSON.parse(fs.readFileSync(UPLOADED_FILE, 'utf8'));
+    } catch (e) {
+      console.error(`Error reading ${UPLOADED_FILE}: ${e.message}`);
+    }
+  }
+  return {};
+}
+
+function saveProgress(data) {
+  fs.writeFileSync(UPLOADED_FILE, JSON.stringify(data, null, 2));
 }
 
 function extractPlaylistName(url) {
@@ -22,6 +50,8 @@ function extractPlaylistName(url) {
 
 function downloadVideo(videoUrl, outputPath, title) {
   return new Promise((resolve) => {
+    if (isShuttingDown) return resolve(false);
+
     if (fs.existsSync(outputPath)) {
       console.log(`[SKIP] Already downloaded: ${title}`);
       return resolve(true);
@@ -40,13 +70,17 @@ function downloadVideo(videoUrl, outputPath, title) {
       "-y"
     ]);
 
+    activeProcesses.add(ffmpeg);
+
     let errorOutput = '';
     ffmpeg.stderr.on("data", (data) => {
         errorOutput += data.toString();
     });
 
     ffmpeg.on("close", (code) => {
-      if (code === 0) {
+      activeProcesses.delete(ffmpeg);
+      
+      if (code === 0 && !isShuttingDown) {
         console.log(`[SUCCESS] Downloaded: ${title}`);
         resolve(true);
       } else {
@@ -59,6 +93,7 @@ function downloadVideo(videoUrl, outputPath, title) {
     });
     
     ffmpeg.on("error", (err) => {
+      activeProcesses.delete(ffmpeg);
       console.error(`[ERROR] Failed to start FFmpeg for ${title}: ${err.message}`);
       resolve(false);
     });
@@ -81,18 +116,39 @@ async function main() {
   }
 
   const queue = [...videos];
+  let uploadedVideos = loadProgress();
 
   async function worker(workerId) {
-    while (queue.length > 0) {
+    while (queue.length > 0 && !isShuttingDown) {
       const item = queue.shift();
       const playlistName = sanitize(extractPlaylistName(item.playlistUrl));
       
       const videoTitle = sanitize(item.title) || `Video_${Math.floor(Math.random() * 100000)}`;
       
+      if (uploadedVideos[item.videoUrl]) {
+        console.log(`[SKIP] Already processed: ${videoTitle}`);
+        continue;
+      }
+      
       const outputPath = path.join(DOWNLOAD_DIR, playlistName, `${videoTitle}.mp4`);
       
       try {
-        await downloadVideo(item.videoUrl, outputPath, videoTitle);
+        const success = await downloadVideo(item.videoUrl, outputPath, videoTitle);
+        if (success && !isShuttingDown) {
+          const uploadId = await uploadToMux(outputPath);
+          
+          uploadedVideos[item.videoUrl] = {
+            ...item,
+            muxUploadId: uploadId,
+            uploadedAt: new Date().toISOString()
+          };
+          saveProgress(uploadedVideos);
+          
+          if (fs.existsSync(outputPath)) {
+            fs.unlinkSync(outputPath);
+            console.log(`[CLEANUP] Deleted local file: ${outputPath}`);
+          }
+        }
       } catch (e) {
         console.error(`[Worker ${workerId}] Failed on ${videoTitle}: ${e.message}`);
       }

@@ -11,3 +11,4 @@ wheels/
 node_modules
 puppeteer_session/
 downloads/
+.env
