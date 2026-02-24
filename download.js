@@ -135,12 +135,18 @@ async function main() {
       try {
         const success = await downloadVideo(item.videoUrl, outputPath, videoTitle);
         if (success && !isShuttingDown) {
-          const uploadId = await uploadToMux(outputPath);
+          const uploadResult = await uploadToMux(outputPath, item);
           
           uploadedVideos[item.videoUrl] = {
-            ...item,
-            muxUploadId: uploadId,
-            uploadedAt: new Date().toISOString()
+            title: item.title,
+            episodeUrl: item.episodeUrl,
+            playlistUrl: item.playlistUrl,
+            originalVideoUrl: item.videoUrl,
+            uploadId: uploadResult.uploadId,
+            uploadUrl: uploadResult.uploadUrl,
+            status: uploadResult.status,
+            metadata: uploadResult.metadata,
+            uploadedAt: uploadResult.uploadedAt
           };
           saveProgress(uploadedVideos);
           
