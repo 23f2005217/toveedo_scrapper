@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { spawn } from "node:child_process";
+import puppeteer from 'puppeteer';
 import { uploadToMux } from './mux_upload.js';
 
 const INPUT_FILE = 'direct_videos.json';
@@ -48,13 +49,78 @@ function extractPlaylistName(url) {
   }
 }
 
+// Returns the exp timestamp (seconds) from a JWT token in the URL, or null if no token.
+function getTokenExpiry(videoUrl) {
+  try {
+    const match = videoUrl.match(/[?&]token=([^&]+)/);
+    if (!match) return null;
+    const payload = match[1].split('.')[1];
+    const decoded = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    return decoded.exp || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+// Re-scrapes the episode page to get a fresh video URL with a new token.
+// Returns the fresh URL, or null on failure.
+async function refreshTokenUrl(browser, episodeUrl) {
+  let page;
+  try {
+    page = await browser.newPage();
+    await page.goto(episodeUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await new Promise((r) => setTimeout(r, 6000));
+    const src = await page.evaluate(() => {
+      const source = document.querySelector('source');
+      return source ? source.src : null;
+    });
+    return src || null;
+  } catch (e) {
+    console.error(`[REFRESH] Failed to re-scrape ${episodeUrl}: ${e.message}`);
+    return null;
+  } finally {
+    if (page) await page.close();
+  }
+}
+
+async function login(page) {
+  console.log('[LOGIN] Checking login status...');
+  await page.goto('https://toveedo.com/catalog', { waitUntil: 'domcontentloaded' });
+  const isSignedIn = await page.$('a[href="/sign_out"]');
+  if (isSignedIn) {
+    console.log('[LOGIN] Already logged in, skipping.');
+    return;
+  }
+
+  console.log('[LOGIN] Not logged in, performing login...');
+  await page.goto('https://toveedo.com/sign_in?passwordless=false&email=1%401.com', { waitUntil: 'domcontentloaded' });
+
+  try {
+    const emailInput = await page.$('input[type="email"]');
+    if (emailInput) {
+      const emailValue = await page.evaluate((el) => el.value, emailInput);
+      if (!emailValue) await emailInput.type('1@1.com');
+    }
+    await page.waitForSelector('input[type="password"]', { timeout: 10000 });
+    await page.type('input[type="password"]', '11111111');
+    await Promise.all([
+      page.evaluate(() => { const btn = document.querySelector('[type="submit"]'); if (btn) btn.click(); }),
+      page.waitForNavigation({ waitUntil: 'domcontentloaded', timeout: 30000 }),
+    ]);
+    await new Promise((r) => setTimeout(r, 5000));
+    console.log('[LOGIN] Login successful.');
+  } catch (e) {
+    console.error(`[LOGIN] Login failed: ${e.message}`);
+  }
+}
+
 function downloadVideo(videoUrl, outputPath, title) {
   return new Promise((resolve) => {
-    if (isShuttingDown) return resolve(false);
+    if (isShuttingDown) return resolve({ success: false, reason: 'shutdown' });
 
     if (fs.existsSync(outputPath)) {
       console.log(`[SKIP] Already downloaded: ${title}`);
-      return resolve(true);
+      return resolve({ success: true });
     }
 
     console.log(`[DOWNLOADING] ${title}...`);
@@ -82,20 +148,21 @@ function downloadVideo(videoUrl, outputPath, title) {
       
       if (code === 0 && !isShuttingDown) {
         console.log(`[SUCCESS] Downloaded: ${title}`);
-        resolve(true);
+        resolve({ success: true });
       } else {
-        console.error(`[ERROR] FFmpeg exited with code ${code} for ${title}. Info: ${errorOutput.substring(0, 200)}...`);
+        const snippet = errorOutput.substring(0, 300);
+        console.error(`[ERROR] FFmpeg exited with code ${code} for ${title}. Info: ${snippet}...`);
         if (fs.existsSync(outputPath)) {
           fs.unlinkSync(outputPath);
         }
-        resolve(false);
+        resolve({ success: false, reason: snippet });
       }
     });
     
     ffmpeg.on("error", (err) => {
       activeProcesses.delete(ffmpeg);
       console.error(`[ERROR] Failed to start FFmpeg for ${title}: ${err.message}`);
-      resolve(false);
+      resolve({ success: false, reason: err.message });
     });
   });
 }
@@ -115,6 +182,18 @@ async function main() {
     return;
   }
 
+  const browser = await puppeteer.launch({
+    headless: true,
+    args: ['--no-sandbox', '--disable-setuid-sandbox'],
+    userDataDir: './puppeteer_session',
+  });
+
+  // Login once — works from a fresh session on any machine
+  const initPage = await browser.newPage();
+  await initPage.setViewport({ width: 1280, height: 800 });
+  await login(initPage);
+  await initPage.close();
+
   const queue = [...videos];
   let uploadedVideos = loadProgress();
 
@@ -126,14 +205,60 @@ async function main() {
       const videoTitle = sanitize(item.title) || `Video_${Math.floor(Math.random() * 100000)}`;
       
       if (uploadedVideos[item.videoUrl]) {
-        console.log(`[SKIP] Already processed: ${videoTitle}`);
-        continue;
+        const entry = uploadedVideos[item.videoUrl];
+        if (entry.status === 'failed') {
+          console.log(`[RETRY] Previously failed, retrying: ${videoTitle}`);
+        } else {
+          console.log(`[SKIP] Already processed: ${videoTitle}`);
+          continue;
+        }
+      }
+
+      // Check token expiry — refresh on-the-fly if expired
+      let videoUrl = item.videoUrl;
+      const exp = getTokenExpiry(videoUrl);
+      if (exp !== null) {
+        const nowSecs = Math.floor(Date.now() / 1000);
+        if (exp <= nowSecs) {
+          console.warn(`[TOKEN] Expired for: ${videoTitle} — re-scraping episode page...`);
+          if (!item.episodeUrl) {
+            console.error(`[TOKEN] No episodeUrl to re-scrape for: ${videoTitle}, skipping.`);
+            uploadedVideos[item.videoUrl] = {
+              title: item.title,
+              episodeUrl: item.episodeUrl,
+              playlistUrl: item.playlistUrl,
+              originalVideoUrl: item.videoUrl,
+              status: 'failed',
+              failReason: 'token_expired_no_episode_url',
+              failedAt: new Date().toISOString(),
+            };
+            saveProgress(uploadedVideos);
+            continue;
+          }
+          const freshUrl = await refreshTokenUrl(browser, item.episodeUrl);
+          if (!freshUrl) {
+            console.error(`[TOKEN] Could not get fresh URL for: ${videoTitle}, skipping.`);
+            uploadedVideos[item.videoUrl] = {
+              title: item.title,
+              episodeUrl: item.episodeUrl,
+              playlistUrl: item.playlistUrl,
+              originalVideoUrl: item.videoUrl,
+              status: 'failed',
+              failReason: 'token_refresh_failed',
+              failedAt: new Date().toISOString(),
+            };
+            saveProgress(uploadedVideos);
+            continue;
+          }
+          console.log(`[TOKEN] Got fresh URL for: ${videoTitle}`);
+          videoUrl = freshUrl;
+        }
       }
       
       const outputPath = path.join(DOWNLOAD_DIR, playlistName, `${videoTitle}.mp4`);
       
       try {
-        const success = await downloadVideo(item.videoUrl, outputPath, videoTitle);
+        const { success, reason } = await downloadVideo(videoUrl, outputPath, videoTitle);
         if (success && !isShuttingDown) {
           const uploadResult = await uploadToMux(outputPath, item);
           
@@ -154,9 +279,31 @@ async function main() {
             fs.unlinkSync(outputPath);
             console.log(`[CLEANUP] Deleted local file: ${outputPath}`);
           }
+        } else if (!success && !isShuttingDown) {
+          console.error(`[Worker ${workerId}] Marking as failed: ${videoTitle}`);
+          uploadedVideos[item.videoUrl] = {
+            title: item.title,
+            episodeUrl: item.episodeUrl,
+            playlistUrl: item.playlistUrl,
+            originalVideoUrl: item.videoUrl,
+            status: 'failed',
+            failReason: reason || 'unknown',
+            failedAt: new Date().toISOString(),
+          };
+          saveProgress(uploadedVideos);
         }
       } catch (e) {
         console.error(`[Worker ${workerId}] Failed on ${videoTitle}: ${e.message}`);
+        uploadedVideos[item.videoUrl] = {
+          title: item.title,
+          episodeUrl: item.episodeUrl,
+          playlistUrl: item.playlistUrl,
+          originalVideoUrl: item.videoUrl,
+          status: 'failed',
+          failReason: e.message,
+          failedAt: new Date().toISOString(),
+        };
+        saveProgress(uploadedVideos);
       }
     }
   }
@@ -167,6 +314,8 @@ async function main() {
     workers.push(worker(i + 1));
   }
   await Promise.all(workers);
+
+  await browser.close();
   console.log('\nAll downloads completed!');
 }
 
