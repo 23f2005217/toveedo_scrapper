@@ -14,6 +14,8 @@ export async function uploadToMux(filePath, metadata) {
   try {
     // Truncate title to fit Mux's 128 character limit
     const truncatedTitle = (metadata.title || 'Untitled Video').substring(0, 128);
+    // Truncate episodeUrl for external_id field (also 128 char limit)
+    const truncatedEpisodeUrl = (metadata.episodeUrl || '').substring(0, 128);
     
     const upload = await mux.video.uploads.create({
       cors_origin: '*',
@@ -22,7 +24,7 @@ export async function uploadToMux(filePath, metadata) {
         video_quality: 'basic',
         meta: {
           title: truncatedTitle,
-          external_id: metadata.episodeUrl || ''
+          external_id: truncatedEpisodeUrl
         },
         passthrough: metadata.playlistUrl || ''
       }
