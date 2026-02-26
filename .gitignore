@@ -12,3 +12,8 @@ node_modules
 puppeteer_session/
 downloads/
 .env
+
+# State files - these contain progress/data specific to each environment
+uploaded_videos.json
+visited_direct_videos.json
+direct_videos.json

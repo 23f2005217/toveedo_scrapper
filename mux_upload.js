@@ -12,13 +12,16 @@ const mux = new Mux({
 
 export async function uploadToMux(filePath, metadata) {
   try {
+    // Truncate title to fit Mux's 128 character limit
+    const truncatedTitle = (metadata.title || 'Untitled Video').substring(0, 128);
+    
     const upload = await mux.video.uploads.create({
       cors_origin: '*',
       new_asset_settings: {
         playback_policy: ['public'],
         video_quality: 'basic',
         meta: {
-          title: metadata.title || 'Untitled Video',
+          title: truncatedTitle,
           external_id: metadata.episodeUrl || ''
         },
         passthrough: metadata.playlistUrl || ''
@@ -26,7 +29,7 @@ export async function uploadToMux(filePath, metadata) {
     });
 
     const uploadUrl = upload.url;
-    console.log(`[MUX UPLOAD] Created upload URL. Metadata: ${metadata.title}`);
+    console.log(`[MUX UPLOAD] Created upload URL. Metadata: ${truncatedTitle}`);
 
     const fileStream = fs.createReadStream(filePath);
     const stats = fs.statSync(filePath);
@@ -40,14 +43,14 @@ export async function uploadToMux(filePath, metadata) {
       maxContentLength: Infinity
     });
 
-    console.log(`[MUX UPLOAD SUCCESS] Upload initiated for ${metadata.title}`);
+    console.log(`[MUX UPLOAD SUCCESS] Upload initiated for ${truncatedTitle}`);
 
     return {
       uploadId: upload.id,
       uploadUrl: uploadUrl,
       status: 'uploaded',
       metadata: {
-        title: metadata.title,
+        title: truncatedTitle,
         episodeUrl: metadata.episodeUrl,
         playlistUrl: metadata.playlistUrl,
         originalVideoUrl: metadata.videoUrl,
