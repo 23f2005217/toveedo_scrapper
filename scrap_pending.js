@@ -6,7 +6,7 @@ const PLAYLISTS_FILE = "playlists.json";
 const OUTPUT_FILE = "direct_videos.json";
 const VISITED_FILE = "visited_direct_videos.json";
 const UPLOADED_FILE = "uploaded_videos.json";
-const CONCURRENCY_LIMIT = 20; // Number of parallel tabs to run!
+const CONCURRENCY_LIMIT = 30; // Number of parallel tabs to run!
 
 // Build a Set of already-uploaded episodeUrls using jq — avoid reading large files directly
 function loadUploadedEpisodeUrls() {
@@ -14,10 +14,12 @@ function loadUploadedEpisodeUrls() {
   try {
     const raw = execSync(
       `jq -r '[to_entries[] | .value.episodeUrl | select(. != null)] | .[]' ${UPLOADED_FILE}`,
-      { encoding: "utf8" }
+      { encoding: "utf8" },
     );
     const urls = raw.trim().split("\n").filter(Boolean);
-    console.log(`Loaded ${urls.length} already-uploaded episode URLs from ${UPLOADED_FILE}.`);
+    console.log(
+      `Loaded ${urls.length} already-uploaded episode URLs from ${UPLOADED_FILE}.`,
+    );
     return new Set(urls);
   } catch (e) {
     console.error(`Could not load uploaded episodes: ${e.message}`);
@@ -167,7 +169,9 @@ async function scrape() {
         for (const epUrl of uniqueEpisodes) {
           // Skip episodes already uploaded to Mux
           if (uploadedEpisodeUrls.has(epUrl)) {
-            console.log(`[Worker ${workerId}]   Skipping already uploaded: ${epUrl}`);
+            console.log(
+              `[Worker ${workerId}]   Skipping already uploaded: ${epUrl}`,
+            );
             continue;
           }
 
@@ -226,7 +230,9 @@ async function scrape() {
                 });
                 resultEpisodeUrls.add(epUrl);
               } else {
-                console.log(`[Worker ${workerId}]     --- Duplicate skipped: ${epUrl}`);
+                console.log(
+                  `[Worker ${workerId}]     --- Duplicate skipped: ${epUrl}`,
+                );
               }
               saveResults();
             } else {
