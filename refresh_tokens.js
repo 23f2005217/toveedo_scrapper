@@ -1,29 +1,32 @@
 import puppeteer from "puppeteer";
 import fs from "fs";
-import { execSync } from "child_process";
 
 const INPUT_FILE = "direct_videos.json";
-const OUTPUT_FILE = "direct_videos_refreshed.json";
 const UPLOADED_FILE = "uploaded_videos.json";
-const CONCURRENCY_LIMIT = 20; // Number of parallel tabs to run!
+const CONCURRENCY_LIMIT = 40; // Number of parallel tabs to run!
 
-// Build a Set of already-uploaded episodeUrls using jq — avoid reading large files directly
-function loadUploadedEpisodeUrls() {
+// Build a Set of already-uploaded base URLs from uploaded_videos.json
+function loadUploadedBaseUrls() {
   if (!fs.existsSync(UPLOADED_FILE)) return new Set();
   try {
-    const raw = execSync(
-      `jq -r '[to_entries[] | .value.episodeUrl | select(. != null)] | .[]' ${UPLOADED_FILE}`,
-      { encoding: "utf8" },
+    const uploaded = JSON.parse(fs.readFileSync(UPLOADED_FILE, "utf8"));
+    // Keys are already base URLs (normalized)
+    const urls = Object.keys(uploaded).filter(
+      (key) => uploaded[key].status !== "failed",
     );
-    const urls = raw.trim().split("\n").filter(Boolean);
     console.log(
-      `Loaded ${urls.length} already-uploaded episode URLs from ${UPLOADED_FILE}.`,
+      `Loaded ${urls.length} already-uploaded base URLs from ${UPLOADED_FILE}.`,
     );
     return new Set(urls);
   } catch (e) {
-    console.error(`Could not load uploaded episodes: ${e.message}`);
+    console.error(`Could not load uploaded videos: ${e.message}`);
     return new Set();
   }
+}
+
+// Strip JWT token from URL to get stable base URL
+function getBaseUrl(videoUrl) {
+  return videoUrl.split("?")[0];
 }
 
 // Returns the exp timestamp (seconds) from a JWT token in the URL, or null if no token.
@@ -31,8 +34,8 @@ function getTokenExpiry(videoUrl) {
   try {
     const match = videoUrl.match(/[?&]token=([^&]+)/);
     if (!match) return null;
-    const payload = match[1].split('.')[1];
-    const decoded = JSON.parse(Buffer.from(payload, 'base64').toString('utf8'));
+    const payload = match[1].split(".")[1];
+    const decoded = JSON.parse(Buffer.from(payload, "base64").toString("utf8"));
     return decoded.exp || null;
   } catch (e) {
     return null;
@@ -108,12 +111,12 @@ async function refreshTokens() {
     return;
   }
 
-  const uploadedEpisodeUrls = loadUploadedEpisodeUrls();
+  const uploadedBaseUrls = loadUploadedBaseUrls();
 
   // Filter to only videos that need processing
-  const videosToProcess = videos.filter(video => {
-    // Skip already uploaded
-    if (uploadedEpisodeUrls.has(video.episodeUrl)) {
+  const videosToProcess = videos.filter((video) => {
+    // Skip already uploaded (match by base URL)
+    if (video.videoUrl && uploadedBaseUrls.has(getBaseUrl(video.videoUrl))) {
       return false;
     }
 
@@ -131,9 +134,13 @@ async function refreshTokens() {
     return false;
   });
 
-  console.log(`Found ${videosToProcess.length} videos needing token refresh (out of ${videos.length} total)`);
-  console.log(`Skipping ${uploadedEpisodeUrls.size} already uploaded videos`);
-  console.log(`Skipping ${videos.length - videosToProcess.length - uploadedEpisodeUrls.size} videos with valid tokens`);
+  console.log(
+    `Found ${videosToProcess.length} videos needing token refresh (out of ${videos.length} total)`,
+  );
+  console.log(`Skipping ${uploadedBaseUrls.size} already uploaded videos`);
+  console.log(
+    `Skipping ${videos.length - videosToProcess.length - uploadedBaseUrls.size} videos with valid tokens`,
+  );
 
   if (videosToProcess.length === 0) {
     console.log("No videos need token refresh. Exiting.");
@@ -158,7 +165,7 @@ async function refreshTokens() {
   const processedVideos = [...videos]; // Copy original array
 
   function saveResults() {
-    fs.writeFileSync(OUTPUT_FILE, JSON.stringify(processedVideos, null, 2));
+    fs.writeFileSync(INPUT_FILE, JSON.stringify(processedVideos, null, 2));
   }
 
   // Worker function
@@ -168,9 +175,11 @@ async function refreshTokens() {
 
     while (queue.length > 0) {
       const video = queue.shift();
-      console.log(`\n[Worker ${workerId}] Processing (${queue.length} remaining): ${video.title || 'Untitled'}`);
+      console.log(
+        `\n[Worker ${workerId}] Processing (${queue.length} remaining): ${video.title || "Untitled"}`,
+      );
       console.log(`[Worker ${workerId}]   Episode: ${video.episodeUrl}`);
-      
+
       if (video.videoUrl && isTokenExpired(video.videoUrl)) {
         console.log(`[Worker ${workerId}]   Token expired, refreshing...`);
       } else if (!video.videoUrl) {
@@ -196,21 +205,27 @@ async function refreshTokens() {
 
         if (src) {
           // Find and update the video in the processedVideos array
-          const videoIndex = processedVideos.findIndex(v => v.episodeUrl === video.episodeUrl);
+          const videoIndex = processedVideos.findIndex(
+            (v) => v.episodeUrl === video.episodeUrl,
+          );
           if (videoIndex !== -1) {
             processedVideos[videoIndex] = {
               ...processedVideos[videoIndex],
               title: title || processedVideos[videoIndex].title,
               videoUrl: src,
             };
-            console.log(`[Worker ${workerId}]     ✅ REFRESHED: ${title} -> ${src.substring(0, 100)}...`);
+            console.log(
+              `[Worker ${workerId}]     REFRESHED: ${title} -> ${src.substring(0, 100)}...`,
+            );
           }
           saveResults();
         } else {
-          console.log(`[Worker ${workerId}]     ❌ No video source found`);
+          console.log(`[Worker ${workerId}]     No video source found`);
         }
       } catch (e) {
-        console.error(`[Worker ${workerId}]     Error processing ${video.episodeUrl}: ${e.message}`);
+        console.error(
+          `[Worker ${workerId}]     Error processing ${video.episodeUrl}: ${e.message}`,
+        );
       }
     }
 
@@ -227,11 +242,13 @@ async function refreshTokens() {
   await Promise.all(workers);
 
   console.log("\nToken refresh completed!");
-  console.log(`Results saved to: ${OUTPUT_FILE}`);
-  
+  console.log(`Results saved to: ${INPUT_FILE}`);
+
   // Show summary
-  const refreshedVideos = processedVideos.filter(v => v.videoUrl);
-  const withValidTokens = refreshedVideos.filter(v => !isTokenExpired(v.videoUrl));
+  const refreshedVideos = processedVideos.filter((v) => v.videoUrl);
+  const withValidTokens = refreshedVideos.filter(
+    (v) => !isTokenExpired(v.videoUrl),
+  );
   console.log(`Total videos: ${processedVideos.length}`);
   console.log(`Videos with URLs: ${refreshedVideos.length}`);
   console.log(`Videos with valid tokens: ${withValidTokens.length}`);
@@ -240,3 +257,4 @@ async function refreshTokens() {
 }
 
 refreshTokens();
+

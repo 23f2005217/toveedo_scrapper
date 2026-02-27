@@ -67,6 +67,11 @@ function extractPlaylistName(url) {
   }
 }
 
+// Strip JWT token from URL to get stable base URL for dedup
+function getBaseUrl(videoUrl) {
+  return videoUrl.split('?')[0];
+}
+
 function getTokenExpiry(videoUrl) {
   try {
     const match = videoUrl.match(/[?&]token=([^&]+)/);
@@ -188,8 +193,9 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
       const playlistName = sanitize(extractPlaylistName(item.playlistUrl));
       const videoTitle = sanitize(item.title) || `Video_${Math.floor(Math.random() * 100000)}`;
       
-      if (uploadedVideos[item.videoUrl]) {
-        const entry = uploadedVideos[item.videoUrl];
+      const baseUrl = getBaseUrl(item.videoUrl);
+      if (uploadedVideos[baseUrl]) {
+        const entry = uploadedVideos[baseUrl];
         if (entry.status === 'failed') {
           console.log(`[RETRY] Previously failed, retrying: ${videoTitle}`);
         } else {
@@ -207,7 +213,7 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
           console.warn(`[TOKEN] Expired for: ${videoTitle} — re-scraping episode page...`);
           if (!item.episodeUrl) {
             console.error(`[TOKEN] No episodeUrl to re-scrape for: ${videoTitle}, skipping.`);
-            uploadedVideos[item.videoUrl] = {
+            uploadedVideos[baseUrl] = {
               title: item.title,
               episodeUrl: item.episodeUrl,
               playlistUrl: item.playlistUrl,
@@ -220,10 +226,24 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
             continue;
           }
           
+          if (!refreshPage) {
+            console.error(`[TOKEN] Token expired for: ${videoTitle} but no browser available, skipping.`);
+            uploadedVideos[baseUrl] = {
+              title: item.title,
+              episodeUrl: item.episodeUrl,
+              playlistUrl: item.playlistUrl,
+              originalVideoUrl: item.videoUrl,
+              status: 'failed',
+              failReason: 'token_expired_no_browser',
+              failedAt: new Date().toISOString(),
+            };
+            saveProgress(uploadedVideos);
+            continue;
+          }
           const freshUrl = await refreshTokenUrl(refreshPage, item.episodeUrl);
           if (!freshUrl) {
             console.error(`[TOKEN] Could not get fresh URL for: ${videoTitle}, skipping.`);
-            uploadedVideos[item.videoUrl] = {
+            uploadedVideos[baseUrl] = {
               title: item.title,
               episodeUrl: item.episodeUrl,
               playlistUrl: item.playlistUrl,
@@ -247,7 +267,7 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
         if (success && !isShuttingDown) {
           const uploadResult = await uploadToMux(outputPath, item);
           
-          uploadedVideos[item.videoUrl] = {
+          uploadedVideos[baseUrl] = {
             title: item.title,
             episodeUrl: item.episodeUrl,
             playlistUrl: item.playlistUrl,
@@ -266,7 +286,7 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
           }
         } else if (!success && !isShuttingDown) {
           console.error(`[Worker ${workerId}] Marking as failed: ${videoTitle}`);
-          uploadedVideos[item.videoUrl] = {
+          uploadedVideos[baseUrl] = {
             title: item.title,
             episodeUrl: item.episodeUrl,
             playlistUrl: item.playlistUrl,
@@ -285,7 +305,7 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
         
       } catch (e) {
         console.error(`[Worker ${workerId}] Failed on ${videoTitle}: ${e.message}`);
-        uploadedVideos[item.videoUrl] = {
+        uploadedVideos[baseUrl] = {
           title: item.title,
           episodeUrl: item.episodeUrl,
           playlistUrl: item.playlistUrl,
@@ -322,35 +342,49 @@ async function main() {
     return;
   }
 
-  globalBrowser = await puppeteer.launch({
-    headless: true,
-    args: [
-      '--no-sandbox', 
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-web-security',
-      '--disable-features=VizDisplayCompositor',
-      '--max-old-space-size=512'
-    ],
-    userDataDir: './puppeteer_session',
-  });
-
-  // Login once and create a dedicated refresh page
-  const initPage = await globalBrowser.newPage();
-  await initPage.setViewport({ width: 1280, height: 800 });
-  await login(initPage);
-  
-  // Keep one page for token refresh operations
-  const refreshPage = await globalBrowser.newPage();
-  await refreshPage.setViewport({ width: 1280, height: 800 });
-  
-  await initPage.close();
-
   let uploadedVideos = loadProgress();
 
-  // Filter out already processed videos
-  const unprocessedVideos = videos.filter(video => !uploadedVideos[video.videoUrl] || uploadedVideos[video.videoUrl].status === 'failed');
-  
+  // Filter out already processed videos (match by base URL to handle token changes)
+  const unprocessedVideos = videos.filter(video => {
+    const base = getBaseUrl(video.videoUrl);
+    return !uploadedVideos[base] || uploadedVideos[base].status === 'failed';
+  });
+
+  // Only launch browser if there are expired tokens in videos that aren't already failed
+  const nowSecs = Math.floor(Date.now() / 1000);
+  const needsBrowser = unprocessedVideos.some(v => {
+    const base = getBaseUrl(v.videoUrl);
+    // Skip already-failed entries — they'll be skipped in the worker anyway
+    if (uploadedVideos[base] && uploadedVideos[base].status === 'failed') return false;
+    const exp = getTokenExpiry(v.videoUrl);
+    return exp !== null && exp <= nowSecs;
+  });
+
+  let refreshPage = null;
+  if (needsBrowser) {
+    console.log('[BROWSER] Expired tokens detected, launching Puppeteer for refresh...');
+    globalBrowser = await puppeteer.launch({
+      headless: true,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-web-security',
+        '--disable-features=VizDisplayCompositor',
+        '--max-old-space-size=512'
+      ],
+      userDataDir: './puppeteer_session',
+    });
+    const initPage = await globalBrowser.newPage();
+    await initPage.setViewport({ width: 1280, height: 800 });
+    await login(initPage);
+    refreshPage = await globalBrowser.newPage();
+    await refreshPage.setViewport({ width: 1280, height: 800 });
+    await initPage.close();
+  } else {
+    console.log('[BROWSER] All tokens valid, skipping Puppeteer launch (saves ~3GB RAM).');
+  }
+
   console.log(`Processing ${unprocessedVideos.length} unprocessed videos in batches of ${BATCH_SIZE}...`);
   logMemoryUsage();
 
@@ -358,17 +392,17 @@ async function main() {
   for (let i = 0; i < unprocessedVideos.length && !isShuttingDown; i += BATCH_SIZE) {
     const batch = unprocessedVideos.slice(i, i + BATCH_SIZE);
     console.log(`\n[BATCH] Processing videos ${i + 1} to ${Math.min(i + BATCH_SIZE, unprocessedVideos.length)} of ${unprocessedVideos.length}`);
-    
+
     await processBatch(batch, uploadedVideos, refreshPage);
-    
+
     logMemoryUsage();
     forceGC();
-    
+
     // Small delay between batches
     await new Promise(r => setTimeout(r, 2000));
   }
 
-  await globalBrowser.close();
+  if (globalBrowser) await globalBrowser.close();
   console.log('\nAll downloads completed!');
   logMemoryUsage();
 }

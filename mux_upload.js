@@ -12,6 +12,11 @@ const mux = new Mux({
 
 export async function uploadToMux(filePath, metadata) {
   try {
+    // Check if file exists before proceeding
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File not found: ${filePath}`);
+    }
+    
     // Truncate title to fit Mux's 128 character limit
     const truncatedTitle = (metadata.title || 'Untitled Video').substring(0, 128);
     // Truncate episodeUrl for external_id field (also 128 char limit)
@@ -32,6 +37,11 @@ export async function uploadToMux(filePath, metadata) {
 
     const uploadUrl = upload.url;
     console.log(`[MUX UPLOAD] Created upload URL. Metadata: ${truncatedTitle}`);
+
+    // Double-check file still exists before creating read stream
+    if (!fs.existsSync(filePath)) {
+      throw new Error(`File was deleted during upload preparation: ${filePath}`);
+    }
 
     const fileStream = fs.createReadStream(filePath);
     const stats = fs.statSync(filePath);
