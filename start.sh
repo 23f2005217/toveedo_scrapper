@@ -21,8 +21,8 @@ rm -f $WORKDIR/puppeteer_session/SingletonLock \
 tmux kill-session -t $SESSION 2>/dev/null
 sleep 1
 
-# Start fresh tmux session and run node inside it
-tmux new-session -d -s $SESSION -x 220 -y 50 "cd $WORKDIR && node download_optimized.js 2>&1 | tee -a $LOGFILE"
+# Start fresh tmux session — run_loop.sh handles auto-restart on crash
+tmux new-session -d -s $SESSION -x 220 -y 50 "bash $WORKDIR/run_loop.sh"
 
 echo "Started in tmux session: $SESSION"
 echo ""

@@ -4,10 +4,10 @@ import { spawn } from "node:child_process";
 import puppeteer from 'puppeteer';
 import { uploadToMux } from './mux_upload.js';
 
-const INPUT_FILE = 'direct_videos.json';
+const INPUT_FILE = 'remaining_videos.json';
 const DOWNLOAD_DIR = 'downloads';
 const UPLOADED_FILE = 'uploaded_videos.json';
-const CONCURRENCY_LIMIT = 2; // Reduced for VPS memory constraints
+const CONCURRENCY_LIMIT = 1; // 1 worker to stay within VPS RAM limits
 const BATCH_SIZE = 50; // Process videos in smaller batches
 
 let isShuttingDown = false;
@@ -147,8 +147,7 @@ function downloadVideo(videoUrl, outputPath, title) {
     const ffmpeg = spawn("ffmpeg", [
       "-i", videoUrl,
       "-c", "copy",
-      "-bsf:a", "aac_adtstoasc", 
-      "-movflags", "frag_keyframe+empty_moov",
+      "-bsf:a", "aac_adtstoasc",
       outputPath,
       "-y"
     ]);
@@ -265,6 +264,20 @@ async function processBatch(videos, uploadedVideos, refreshPage) {
       try {
         const { success, reason } = await downloadVideo(videoUrl, outputPath, videoTitle);
         if (success && !isShuttingDown) {
+          // Skip files over 1.5GB — axios upload would OOM the VPS
+          const MAX_UPLOAD_BYTES = 1.5 * 1024 * 1024 * 1024;
+          const fileSize = fs.existsSync(outputPath) ? fs.statSync(outputPath).size : 0;
+          if (fileSize > MAX_UPLOAD_BYTES) {
+            console.error(`[SKIP] File too large for VPS upload (${Math.round(fileSize/1024/1024)}MB): ${videoTitle}`);
+            fs.unlinkSync(outputPath);
+            uploadedVideos[baseUrl] = {
+              title: item.title, episodeUrl: item.episodeUrl, playlistUrl: item.playlistUrl,
+              originalVideoUrl: item.videoUrl, status: 'failed',
+              failReason: `file_too_large_${Math.round(fileSize/1024/1024)}MB`, failedAt: new Date().toISOString(),
+            };
+            saveProgress(uploadedVideos);
+            continue;
+          }
           const uploadResult = await uploadToMux(outputPath, item);
           
           uploadedVideos[baseUrl] = {
@@ -350,19 +363,15 @@ async function main() {
     return !uploadedVideos[base] || uploadedVideos[base].status === 'failed';
   });
 
-  // Only launch browser if there are expired tokens in videos that aren't already failed
-  const nowSecs = Math.floor(Date.now() / 1000);
-  const needsBrowser = unprocessedVideos.some(v => {
-    const base = getBaseUrl(v.videoUrl);
-    // Skip already-failed entries — they'll be skipped in the worker anyway
-    if (uploadedVideos[base] && uploadedVideos[base].status === 'failed') return false;
-    const exp = getTokenExpiry(v.videoUrl);
-    return exp !== null && exp <= nowSecs;
-  });
+  // Always launch browser so it's available for mid-run token expiry.
+  // NO_BROWSER=1 disables Puppeteer entirely (legacy flag, no longer used on VPS).
+  const noBrowser = process.env.NO_BROWSER === '1';
 
   let refreshPage = null;
-  if (needsBrowser) {
-    console.log('[BROWSER] Expired tokens detected, launching Puppeteer for refresh...');
+  if (noBrowser) {
+    console.log('[BROWSER] NO_BROWSER=1 set — Puppeteer disabled. Expired tokens will be skipped.');
+  } else {
+    console.log('[BROWSER] Launching Puppeteer for token refresh (available for any mid-run expiry)...');
     globalBrowser = await puppeteer.launch({
       headless: true,
       args: [
@@ -381,8 +390,7 @@ async function main() {
     refreshPage = await globalBrowser.newPage();
     await refreshPage.setViewport({ width: 1280, height: 800 });
     await initPage.close();
-  } else {
-    console.log('[BROWSER] All tokens valid, skipping Puppeteer launch (saves ~3GB RAM).');
+    console.log('[BROWSER] Puppeteer ready.');
   }
 
   console.log(`Processing ${unprocessedVideos.length} unprocessed videos in batches of ${BATCH_SIZE}...`);
